@@ -16,7 +16,7 @@ retargeting = RetargetingConfig.load_from_file(config_path).build()
 human_keys = [""]
 
 # load a json file and read the data
-with open("/home/hjp/ws_twist2/TWIST2/s2.json", "r", encoding="utf-8") as f:
+with open("/home/hjp/ws_twist2/TWIST2/smplx.json", "r", encoding="utf-8") as f:
     data = json.load(f)
 
 
@@ -73,7 +73,7 @@ wrist_pos = np.zeros(3)
 quat_wrist = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion [w, x, y, z]
 
 # convert from smplx to urdf coordinate frame
-smplx2urdf = np.array([[0,0,1],[1,0,0],[0,1,0]])
+smplx2urdf = np.array([[0,-1, 0],[-1,0,0],[0,0,-1]])
 finger_tips = finger_tips @ smplx2urdf
 wrist_pos = wrist_pos @ smplx2urdf
 
@@ -264,6 +264,101 @@ actual_finger_tips = np.array([actual_link_positions_dict[name] for name in fing
 print(f"\n实际手指尖位置 (相对于机器人坐标系):")
 for i, name in enumerate(finger_tip_link_names_sorted):
     print(f"  {name}: [{actual_finger_tips[i][0]:.6f}, {actual_finger_tips[i][1]:.6f}, {actual_finger_tips[i][2]:.6f}]")
+
+# ============================================================================
+# Open3D Visualization: Compare reference (input) vs actual (retargeting result)
+# ============================================================================
+# Prepare reference points (original input after coordinate transform)
+ref_wrist_pos = wrist_pos  # Already transformed to wrist coordinate frame
+ref_finger_tips = finger_tips  # Already transformed to wrist coordinate frame
+
+# Prepare actual points (from retargeting)
+actual_wrist_pos_flat = actual_wrist_pos[0]  # Flatten from (1, 3) to (3,)
+
+# Combine all points: [ref_wrist, ref_tips(5), actual_wrist, actual_tips(5)]
+all_points = np.vstack([
+    ref_wrist_pos,           # Reference wrist (1 point)
+    ref_finger_tips,         # Reference finger tips (5 points)
+    actual_wrist_pos_flat.reshape(1, -1),  # Actual wrist (1 point)
+    actual_finger_tips       # Actual finger tips (5 points)
+])  # Total: 12 points
+
+# Create point cloud
+point_cloud = o3d.geometry.PointCloud()
+point_cloud.points = o3d.utility.Vector3dVector(all_points)
+
+# Set colors:
+# Reference wrist: Red
+# Reference finger tips: Blue
+# Actual wrist: Green
+# Actual finger tips: Yellow
+colors = np.array([
+    [1.0, 0.0, 0.0],  # Red for reference wrist
+    [0.0, 0.0, 1.0],  # Blue for reference thumb
+    [0.0, 0.0, 1.0],  # Blue for reference index
+    [0.0, 0.0, 1.0],  # Blue for reference middle
+    [0.0, 0.0, 1.0],  # Blue for reference ring
+    [0.0, 0.0, 1.0],  # Blue for reference pinky
+    [0.0, 1.0, 0.0],  # Green for actual wrist
+    [0.0, 1.0, 0.0],  # Yellow for actual thumb
+    [0.0, 1.0, 0.0],  # Yellow for actual index
+    [0.0, 1.0, 0.0],  # Yellow for actual middle
+    [0.0, 1.0, 0.0],  # Yellow for actual ring
+    [0.0, 1.0, 0.0],  # Yellow for actual pinky
+])
+point_cloud.colors = o3d.utility.Vector3dVector(colors)
+
+# Create coordinate frames
+# Reference coordinate frame at reference wrist
+ref_coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+    size=0.05,
+    origin=ref_wrist_pos
+)
+
+# Actual coordinate frame at actual wrist
+actual_coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+    size=0.05,
+    origin=actual_wrist_pos_flat
+)
+
+# Create lines connecting reference and actual points for better visualization
+# Connect reference wrist to actual wrist
+wrist_line = o3d.geometry.LineSet()
+wrist_line.points = o3d.utility.Vector3dVector([ref_wrist_pos, actual_wrist_pos_flat])
+wrist_line.lines = o3d.utility.Vector2iVector([[0, 1]])
+wrist_line.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]])  # Gray
+
+# Connect each reference finger tip to corresponding actual finger tip
+finger_lines = []
+for i in range(len(ref_finger_tips)):
+    line = o3d.geometry.LineSet()
+    line.points = o3d.utility.Vector3dVector([ref_finger_tips[i], actual_finger_tips[i]])
+    line.lines = o3d.utility.Vector2iVector([[0, 1]])
+    line.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5]])  # Gray
+    finger_lines.append(line)
+
+# Create visualization
+vis = o3d.visualization.Visualizer()
+vis.create_window(window_name="Retargeting Comparison: Reference (Red/Blue) vs Actual (Green/Yellow)")
+vis.add_geometry(point_cloud)
+vis.add_geometry(ref_coordinate_frame)
+vis.add_geometry(actual_coordinate_frame)
+vis.add_geometry(wrist_line)
+for line in finger_lines:
+    vis.add_geometry(line)
+
+# Set point size for better visibility
+render_option = vis.get_render_option()
+render_option.point_size = 10.0
+
+# Run visualization
+print("\n显示retargeting对比可视化窗口...")
+print("红色/蓝色: 参考值 (输入)")
+print("绿色/黄色: 实际值 (retargeting结果)")
+print("灰色线条: 连接对应的参考点和实际点")
+print("按 'Q' 或关闭窗口以继续")
+vis.run()
+vis.destroy_window()
 
 # Compute actual vectors using the same order as ref_value
 # First 10: finger-to-finger vectors (1-2, 1-3, 1-4, 1-5, 2-3, 2-4, 2-5, 3-4, 3-5, 4-5)
