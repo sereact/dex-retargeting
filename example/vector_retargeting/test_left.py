@@ -3,10 +3,14 @@ from dex_retargeting.retargeting_config import RetargetingConfig
 from dex_retargeting.seq_retarget import SeqRetargeting
 
 import json
+from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 from scipy.spatial.transform import Rotation as R
+import sapien
+from sapien.asset import create_dome_envmap
+from sapien.utils import Viewer
 
 config_path='/home/hjp/ws_twist2/dex-retargeting/src/dex_retargeting/configs/teleop/inspire_hand_left_dexpilot_pico.yml'
 root_path = '/home/hjp/ws_twist2/dex-retargeting/assets/robots/hands'
@@ -51,6 +55,7 @@ R_wrist_inv = R_wrist.inv()  # Inverse rotation matrix
 finger_tips_translated = finger_tips - wrist_pos  # (5, 3)
 # Step 2: Rotate to wrist coordinate frame
 finger_tips = R_wrist_inv.apply(finger_tips_translated)  # (5, 3)
+finger_tips -= np.array([0,0,0.08]) #NOTE: hack offset
 
 # Transform finger_tips rotations to wrist coordinate frame
 # For each finger tip quaternion, compute: q_wrist_inv * q_finger
@@ -76,6 +81,12 @@ quat_wrist = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion [w, x, y, z]
 smplx2urdf = np.array([[0,-1, 0],[-1,0,0],[0,0,-1]])
 finger_tips = finger_tips @ smplx2urdf
 wrist_pos = wrist_pos @ smplx2urdf
+
+# Save human data for sapien visualization (after coordinate transformation)
+human_wrist_pos = wrist_pos.copy()
+human_finger_tips = finger_tips.copy()
+human_quat_wrist = quat_wrist.copy()  # [w, x, y, z]
+human_quat_finger_tips = quat_finger_tips.copy()  # (5, 4) [w, x, y, z]
 
 # ============================================================================
 # Open3D Visualization: wrist and finger tips with coordinate frame
@@ -436,4 +447,190 @@ for idx in range(min(3, len(ref_value))):
     print(f"  差值:   [{diff[idx][0]:.6f}, {diff[idx][1]:.6f}, {diff[idx][2]:.6f}]")
     print(f"  误差范数: {diff_norm[idx]:.6f} m, 相对误差: {relative_error[idx]*100:.4f}%")
 
-pass
+# ============================================================================
+# Sapien Visualization: Render robot hand with retargeted joint angles
+# ============================================================================
+print(f"\n{'='*80}")
+print("=== Sapien 可视化 ===")
+print(f"{'='*80}")
+
+# Setup sapien renderer
+sapien.render.set_viewer_shader_dir("default")
+sapien.render.set_camera_shader_dir("default")
+
+# Create scene
+scene = sapien.Scene()
+
+# Ground
+render_mat = sapien.render.RenderMaterial()
+render_mat.base_color = [0.06, 0.08, 0.12, 1]
+render_mat.metallic = 0.0
+render_mat.roughness = 0.9
+render_mat.specular = 0.8
+scene.add_ground(-0.2, render_material=render_mat, render_half_size=[1000, 1000])
+
+# Lighting
+scene.add_directional_light(np.array([1, 1, -1]), np.array([3, 3, 3]))
+scene.add_point_light(np.array([2, 2, 2]), np.array([2, 2, 2]), shadow=False)
+scene.add_point_light(np.array([2, -2, 2]), np.array([2, 2, 2]), shadow=False)
+scene.set_environment_map(
+    create_dome_envmap(sky_color=[0.2, 0.2, 0.2], ground_color=[0.2, 0.2, 0.2])
+)
+
+# Camera
+cam = scene.add_camera(
+    name="Robot Hand Camera", width=600, height=600, fovy=1, near=0.1, far=10
+)
+cam.set_local_pose(sapien.Pose([0.50, 0, 0.0], [0, 0, 0, -1]))
+
+# Load robot
+loader = scene.create_urdf_loader()
+config = RetargetingConfig.load_from_file(config_path)
+filepath = Path(config.urdf_path)
+robot_name = filepath.stem
+loader.load_multiple_collisions_from_file = True
+
+# Set scale based on robot type
+if "inspire" in robot_name:
+    loader.scale = 1.0  # Default scale for inspire hand
+
+# Load GLB version if available
+# if "glb" not in robot_name:
+    # filepath = str(filepath).replace(".urdf", "_glb.urdf")
+# else:
+filepath = str(filepath)
+robot = loader.load(filepath)
+
+# Map joint names from retargeting to sapien
+sapien_joint_names = [joint.get_name() for joint in robot.get_active_joints()]
+retargeting_joint_names = retargeting.joint_names
+retargeting_to_sapien = np.array(
+    [retargeting_joint_names.index(name) for name in sapien_joint_names]
+).astype(int)
+
+# Set robot joint angles
+robot.set_qpos(np.array(robot_qpos)[retargeting_to_sapien])
+
+# ============================================================================
+# Add human data visualization: wrist pose and finger tips
+# ============================================================================
+# Create material for human data visualization
+human_material = sapien.render.RenderMaterial()
+human_material.base_color = [1.0, 0.0, 0.0, 1.0]  # Red for wrist
+human_material.metallic = 0.0
+human_material.roughness = 0.5
+
+finger_material = sapien.render.RenderMaterial()
+finger_material.base_color = [0.0, 0.0, 1.0, 1.0]  # Blue for finger tips
+finger_material.metallic = 0.0
+finger_material.roughness = 0.5
+
+# Add wrist sphere
+wrist_radius = 0.015
+wrist_builder = scene.create_actor_builder()
+wrist_builder.add_sphere_visual(radius=wrist_radius, material=human_material)
+wrist_actor = wrist_builder.build(name="human_wrist")
+wrist_actor.set_pose(sapien.Pose(human_wrist_pos))
+
+# Add finger tip spheres
+finger_radius = 0.01
+finger_actors = []
+finger_names = ["thumb", "index", "middle", "ring", "pinky"]
+for i, (tip_pos, tip_name) in enumerate(zip(human_finger_tips, finger_names)):
+    finger_builder = scene.create_actor_builder()
+    finger_builder.add_sphere_visual(radius=finger_radius, material=finger_material)
+    finger_actor = finger_builder.build(name=f"human_finger_{tip_name}")
+    finger_actor.set_pose(sapien.Pose(tip_pos))
+    finger_actors.append(finger_actor)
+
+# Add coordinate frame at wrist to show orientation
+# Convert quaternion from [w, x, y, z] to sapien format [x, y, z, w]
+quat_wrist_sapien = np.array([human_quat_wrist[1], human_quat_wrist[2], 
+                               human_quat_wrist[3], human_quat_wrist[0]])
+wrist_pose = sapien.Pose(human_wrist_pos, quat_wrist_sapien)
+
+# Get rotation matrix from quaternion
+R_wrist_matrix = wrist_pose.to_transformation_matrix()[:3, :3]
+
+# Create coordinate frame using capsules (X: red, Y: green, Z: blue)
+frame_size = 0.03
+axis_radius = 0.002
+
+# Helper function to create axis arrow
+def create_axis_arrow(axis_direction, color, name):
+    """Create a capsule aligned with the given axis direction"""
+    axis_direction = axis_direction / (np.linalg.norm(axis_direction) + 1e-8)
+    axis_end = human_wrist_pos + axis_direction * frame_size
+    axis_mid = (human_wrist_pos + axis_end) / 2
+    
+    # Default capsule is along Z axis [0, 0, 1]
+    z_axis = np.array([0, 0, 1])
+    if np.abs(np.dot(axis_direction, z_axis)) < 0.99:  # Not parallel
+        rotation_axis = np.cross(z_axis, axis_direction)
+        rotation_axis = rotation_axis / (np.linalg.norm(rotation_axis) + 1e-8)
+        rotation_angle = np.arccos(np.clip(np.dot(z_axis, axis_direction), -1, 1))
+        axis_quat = R.from_rotvec(rotation_axis * rotation_angle).as_quat()  # [x, y, z, w]
+    else:
+        axis_quat = np.array([0, 0, 0, 1])
+    
+    builder = scene.create_actor_builder()
+    builder.add_capsule_visual(radius=axis_radius, half_length=frame_size/2,
+                                material=sapien.render.RenderMaterial(base_color=color))
+    actor = builder.build(name=name)
+    actor.set_pose(sapien.Pose(axis_mid, axis_quat))
+    return actor
+
+# Create axis arrows
+x_arrow = create_axis_arrow(R_wrist_matrix[:, 0], [1, 0, 0, 1], "wrist_frame_x")
+y_arrow = create_axis_arrow(R_wrist_matrix[:, 1], [0, 1, 0, 1], "wrist_frame_y")
+z_arrow = create_axis_arrow(R_wrist_matrix[:, 2], [0, 0, 1, 1], "wrist_frame_z")
+
+# Add lines connecting wrist to finger tips
+line_material = sapien.render.RenderMaterial()
+line_material.base_color = [0.5, 0.5, 0.5, 0.5]  # Gray, semi-transparent
+line_material.metallic = 0.0
+line_material.roughness = 0.5
+
+for i, tip_pos in enumerate(human_finger_tips):
+    # Create a line from wrist to finger tip using a thin capsule
+    direction = tip_pos - human_wrist_pos
+    length = np.linalg.norm(direction)
+    if length > 0:
+        direction = direction / length
+        mid_point = (human_wrist_pos + tip_pos) / 2
+        
+        # Create rotation to align capsule with direction
+        # Default capsule is along Z axis
+        z_axis = np.array([0, 0, 1])
+        if np.abs(np.dot(direction, z_axis)) < 0.99:  # Not parallel
+            rotation_axis = np.cross(z_axis, direction)
+            rotation_axis = rotation_axis / (np.linalg.norm(rotation_axis) + 1e-8)
+            rotation_angle = np.arccos(np.clip(np.dot(z_axis, direction), -1, 1))
+            quat_line = R.from_rotvec(rotation_axis * rotation_angle).as_quat()  # [x, y, z, w]
+        else:
+            quat_line = np.array([0, 0, 0, 1])
+        
+        line_builder = scene.create_actor_builder()
+        line_builder.add_capsule_visual(radius=0.001, half_length=length/2, material=line_material)
+        line_actor = line_builder.build(name=f"wrist_to_finger_{i}")
+        line_actor.set_pose(sapien.Pose(mid_point, quat_line))
+
+print("已添加 human data 可视化:")
+print(f"  - 手腕位置: {human_wrist_pos}")
+print(f"  - 手指尖位置数量: {len(human_finger_tips)}")
+
+# Create viewer
+viewer = Viewer()
+viewer.set_scene(scene)
+viewer.control_window.show_origin_frame = False
+viewer.control_window.move_speed = 0.01
+viewer.control_window.toggle_camera_lines(False)
+viewer.set_camera_pose(cam.get_local_pose())
+
+# Run visualization
+print("\n显示 Sapien 可视化窗口...")
+print("按 'Q' 或关闭窗口以退出")
+while not viewer.closed:
+    viewer.render()
+
+scene = None
